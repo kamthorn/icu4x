@@ -7,6 +7,19 @@ use crate::indices::*;
 use crate::provider::*;
 use crate::scaffold::{PotentiallyIllFormedUtf8, RuleBreakType, Utf8, Utf16};
 
+/// Thai and Lao vowel signs and marks that cannot start a word.
+fn is_dependent(c: u32) -> bool {
+    matches!(
+        c,
+        0x0E30..=0x0E3A | 0x0E45 | 0x0E47..=0x0E4E | 0x0EB0..=0x0EBC | 0x0EC8..=0x0ECE
+    )
+}
+
+/// Thai and Lao vowels written before their consonant, which cannot end a word.
+fn is_leading_vowel(c: u32) -> bool {
+    matches!(c, 0x0E40..=0x0E44 | 0x0EC0..=0x0EC4)
+}
+
 /// Lifetimes:
 /// - `'data` = lifetime of the data
 /// - `'s` = lifetime of the string being segmented
@@ -17,6 +30,72 @@ pub(super) struct DictionaryBreakIterator<'data, 's, R: RuleBreakType> {
     len: usize,
     grapheme_iter: GraphemeClusterBreakIterator<'data, 's, R>,
     // TODO transform value for byte trie
+}
+
+impl<'s, R: RuleBreakType> DictionaryBreakIterator<'_, 's, R> {
+    /// Moves `last_grapheme_offset` to the first grapheme cluster boundary at or after `end`.
+    fn advance_graphemes(&mut self, end: usize, last_grapheme_offset: &mut usize) {
+        while *last_grapheme_offset < end {
+            match self.grapheme_iter.next() {
+                Some(offset) => *last_grapheme_offset = offset,
+                None => {
+                    *last_grapheme_offset = self.len;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Whether a dictionary word can end at `end`: that has to be a grapheme cluster boundary, and
+    /// the next character cannot be a vowel sign or mark that belongs to the word.
+    fn is_word_end(&mut self, end: usize, last_grapheme_offset: &mut usize) -> bool {
+        self.advance_graphemes(end, last_grapheme_offset);
+        *last_grapheme_offset == end
+            && !matches!(self.iter.clone().next(), Some((_, c)) if is_dependent(c.into()))
+    }
+
+    /// Returns the end of a token for which the trie walk found no word, after the character
+    /// `failed` made the walk fail. `before` is the iterator state before `failed`, and `start`
+    /// the start of the token.
+    ///
+    /// The end is moved so that it does not split a grapheme cluster, a syllable (vowel signs and
+    /// marks stay with their consonant) or a leading vowel from its consonant.
+    fn end_of_unknown(
+        &mut self,
+        failed: (usize, R::CharType),
+        before: R::IterAttr<'s>,
+        start: usize,
+        last_grapheme_offset: &mut usize,
+    ) -> usize {
+        let leading = is_leading_vowel(failed.1.into());
+        if leading && failed.0 > start {
+            self.iter = before;
+            return failed.0;
+        }
+
+        let mut end = failed.0 + R::char_len(failed.1);
+        let mut needs_more = leading;
+        while let Some((pos, c)) = self.iter.clone().next() {
+            if !needs_more && !is_dependent(c.into()) {
+                break;
+            }
+            self.iter.next();
+            end = pos + R::char_len(c);
+            needs_more = is_leading_vowel(c.into());
+        }
+
+        self.advance_graphemes(end, last_grapheme_offset);
+        if *last_grapheme_offset > end {
+            while let Some((pos, c)) = self.iter.clone().next() {
+                if pos >= *last_grapheme_offset {
+                    break;
+                }
+                self.iter.next();
+                end = pos + R::char_len(c);
+            }
+        }
+        end
+    }
 }
 
 /// Implement the [`Iterator`] trait over the segmenter break opportunities of the given string.
@@ -46,8 +125,14 @@ impl<Y: RuleBreakType> Iterator for DictionaryBreakIterator<'_, '_, Y> {
         let mut not_match = false;
         let mut previous_match = None;
         let mut last_grapheme_offset = 0;
+        let mut token_start = None;
 
-        while let Some(next) = self.iter.next() {
+        loop {
+            let before = self.iter.clone();
+            let Some(next) = self.iter.next() else {
+                break;
+            };
+            let start = *token_start.get_or_insert(next.0);
             let step_result = match &mut trie_iter {
                 Cursor::Char16(cursor) => {
                     cursor.step32(next.1.into());
@@ -63,44 +148,29 @@ impl<Y: RuleBreakType> Iterator for DictionaryBreakIterator<'_, '_, Y> {
                     (cursor.take_value().is_some(), cursor.is_empty())
                 }
             };
-            match step_result {
-                (true, true) => {
-                    return Some(next.0 + Y::char_len(next.1));
-                }
-                (true, false) => {
-                    // Dictionary has to match with grapheme cluster segment.
-                    // If not, we ignore it.
-                    while last_grapheme_offset < next.0 + Y::char_len(next.1) {
-                        if let Some(offset) = self.grapheme_iter.next() {
-                            last_grapheme_offset = offset;
-                            continue;
-                        }
-                        last_grapheme_offset = self.len;
-                        break;
-                    }
-                    if last_grapheme_offset != next.0 + Y::char_len(next.1) {
-                        continue;
-                    }
+            let (has_value, is_empty) = step_result;
+            let end = next.0 + Y::char_len(next.1);
 
-                    intermediate_length = next.0 + Y::char_len(next.1);
-                    previous_match = Some((self.iter.clone(), self.grapheme_iter.clone_internal()));
+            if has_value && self.is_word_end(end, &mut last_grapheme_offset) {
+                if is_empty {
+                    return Some(end);
                 }
-                (false, true) => {
-                    if intermediate_length > 0 {
-                        if let Some((prev_iter, prev_grapheme_iter)) = previous_match {
-                            // Rewind previous match point
-                            self.iter = prev_iter;
-                            self.grapheme_iter = prev_grapheme_iter;
-                        }
-                        return Some(intermediate_length);
+                intermediate_length = end;
+                previous_match = Some((self.iter.clone(), self.grapheme_iter.clone_internal()));
+            } else if is_empty {
+                if intermediate_length > 0 {
+                    if let Some((prev_iter, prev_grapheme_iter)) = previous_match {
+                        // Rewind previous match point
+                        self.iter = prev_iter;
+                        self.grapheme_iter = prev_grapheme_iter;
                     }
-                    // Not found
-                    return Some(next.0 + Y::char_len(next.1));
+                    return Some(intermediate_length);
                 }
-                (false, false) => {
-                    // Prefix string is matched
-                    not_match = true;
-                }
+                // Not found
+                return Some(self.end_of_unknown(next, before, start, &mut last_grapheme_offset));
+            } else if !has_value {
+                // Prefix string is matched
+                not_match = true;
             }
         }
 
@@ -269,6 +339,50 @@ mod tests {
         let s = "エディターエディター";
         let result: Vec<usize> = dict_segmenter.segment_str(s).collect();
         assert_eq!(result, vec![15, 30]);
+    }
+
+    #[test]
+    fn thai_dictionary_keeps_syllables_together() {
+        let mut payloads = ComplexPayloadsBorrowed::new();
+        payloads.with_southeast_asian_dictionaries();
+        let segmenter = payloads.select(ComplexScript::Thai).unwrap();
+
+        // Words that are not in the dictionary used to be cut between a consonant and its
+        // vowel sign or tone mark.
+        check_complex(
+            "ธนภัทรกับกฤตธีชญ์เล่นเกม",
+            &["ธน", "ภัทร", "กับ", "กฤตธี", "ชญ์", "เล่น", "เกม"],
+            segmenter,
+        );
+        // A dictionary word that ends right before a tone mark is not a match.
+        check_complex(
+            "ตามที่กล่าวมาแล้ว",
+            &["ตาม", "ที่", "กล่าว", "มา", "แล้ว"],
+            segmenter,
+        );
+
+        for text in [
+            "ลุงไมเคิลเดินไปตลาด",
+            "ธนภัทรกับกฤตธีชญ์เล่นเกม",
+            "พ่อค้าชื่อวิษณุสุขเกษมขายผลไม้",
+            "เธอชอบกินข้าวผัดกะเพราไก่ไข่ดาว",
+        ] {
+            let mut start = 0;
+            for end in segmenter.segment_str(text, GraphemeClusterSegmenter::new(), 0) {
+                let segment = &text[start..end];
+                let first = segment.chars().next().unwrap() as u32;
+                let last = segment.chars().next_back().unwrap() as u32;
+                assert!(
+                    !is_dependent(first),
+                    "{segment} starts with a vowel sign: {text}"
+                );
+                assert!(
+                    !is_leading_vowel(last),
+                    "{segment} ends with a leading vowel: {text}"
+                );
+                start = end;
+            }
+        }
     }
 
     #[test]
