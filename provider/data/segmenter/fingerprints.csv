@@ -31,10 +31,10 @@ segmenter/dictionary/extended/v2, und/burmesedict, 263923B, 263873B, b355a883a47
 segmenter/dictionary/extended/v2, und/khmerdict, 472281B, 472231B, 51bb9f95290852c0
 segmenter/dictionary/extended/v2, und/laodict, 168096B, 168046B, 2e701bb34af10ce2
 segmenter/dictionary/extended/v2, und/thaidict, 131809B, 131759B, 9d5307164ec2da5d
-segmenter/lstm/auto/v1, <lookup>, 199B, 4 identifiers
-segmenter/lstm/auto/v1, <total>, 310517B, 309331B, 4 unique payloads
-segmenter/lstm/auto/v1, und/Burmese_codepoints_exclusive_model4_heavy, 91365B, 91070B, 6e46dc061672ffe5
-segmenter/lstm/auto/v1, und/Khmer_codepoints_exclusive_model4_heavy, 74665B, 74368B, cc6fe9f66fed196d
-segmenter/lstm/auto/v1, und/Lao_codepoints_exclusive_model4_heavy, 72160B, 71863B, 3f52a4025c7d618f
-segmenter/lstm/auto/v1, und/Thai_codepoints_exclusive_model4_heavy, 72327B, 72030B, 4486b38238d7c651
+segmenter/lstm/auto/v2, <lookup>, 199B, 4 identifiers
+segmenter/lstm/auto/v2, <total>, 310517B, 309307B, 4 unique payloads
+segmenter/lstm/auto/v2, und/Burmese_codepoints_exclusive_model4_heavy, 91365B, 91064B, f2a942140af753ef
+segmenter/lstm/auto/v2, und/Khmer_codepoints_exclusive_model4_heavy, 74665B, 74362B, 2793d53cbf4f45ce
+segmenter/lstm/auto/v2, und/Lao_codepoints_exclusive_model4_heavy, 72160B, 71857B, eb6aef12f886dc93
+segmenter/lstm/auto/v2, und/Thai_codepoints_exclusive_model4_heavy, 72327B, 72024B, 82e47338c3e38c7
 segmenter/unihan/radical/v1, <singleton>, 13080B, 13020B, d875e702fbedc249

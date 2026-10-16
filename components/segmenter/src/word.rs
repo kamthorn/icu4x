@@ -340,7 +340,7 @@ impl WordSegmenter {
         D: DataProvider<SegmenterBreakWordV1>
             + DataProvider<SegmenterBreakWordOverrideV1>
             + DataProvider<SegmenterDictionaryAutoV2>
-            + DataProvider<SegmenterLstmAutoV1>
+            + DataProvider<SegmenterLstmAutoV2>
             + DataProvider<SegmenterBreakGraphemeClusterV1>
             + ?Sized,
     {
@@ -411,7 +411,7 @@ impl WordSegmenter {
     where
         D: DataProvider<SegmenterBreakWordV1>
             + DataProvider<SegmenterBreakWordOverrideV1>
-            + DataProvider<SegmenterLstmAutoV1>
+            + DataProvider<SegmenterLstmAutoV2>
             + DataProvider<SegmenterBreakGraphemeClusterV1>
             + ?Sized,
     {
@@ -586,7 +586,7 @@ impl WordSegmenter {
     #[cfg(feature = "lstm")]
     pub fn load_lstm_unstable<D>(&mut self, provider: &D) -> Result<(), DataError>
     where
-        D: DataProvider<SegmenterLstmAutoV1> + ?Sized,
+        D: DataProvider<SegmenterLstmAutoV2> + ?Sized,
     {
         let complex = match self.0 {
             WordSegmenterInner::V1 {
@@ -611,7 +611,16 @@ impl WordSegmenter {
         &mut self,
         provider: &(impl BufferProvider + ?Sized),
     ) -> Result<(), DataError> {
-        self.load_lstm_unstable(&provider.as_deserializing())
+        let complex = match self.0 {
+            WordSegmenterInner::V1 {
+                ref mut complex, ..
+            } => complex,
+            #[cfg(feature = "unstable")]
+            WordSegmenterInner::V2 {
+                ref mut complex, ..
+            } => complex,
+        };
+        complex.with_southeast_asian_lstms_buffer(&provider.as_deserializing())
     }
 
     /// Loads dictionary data for a [`WordSegmenter`] constructed with
@@ -664,7 +673,7 @@ impl WordSegmenter {
     #[cfg(feature = "auto")]
     pub fn load_auto_unstable<D>(&mut self, provider: &D) -> Result<(), DataError>
     where
-        D: DataProvider<SegmenterDictionaryAutoV2> + DataProvider<SegmenterLstmAutoV1> + ?Sized,
+        D: DataProvider<SegmenterDictionaryAutoV2> + DataProvider<SegmenterLstmAutoV2> + ?Sized,
     {
         let complex = match self.0 {
             WordSegmenterInner::V1 {
@@ -690,7 +699,18 @@ impl WordSegmenter {
         &mut self,
         provider: &(impl BufferProvider + ?Sized),
     ) -> Result<(), DataError> {
-        self.load_auto_unstable(&provider.as_deserializing())
+        let complex = match self.0 {
+            WordSegmenterInner::V1 {
+                ref mut complex, ..
+            } => complex,
+            #[cfg(feature = "unstable")]
+            WordSegmenterInner::V2 {
+                ref mut complex, ..
+            } => complex,
+        };
+        complex.with_southeast_asian_lstms_buffer(&provider.as_deserializing())?;
+        complex.with_japanese_dictionary_buffer(&provider.as_deserializing())?;
+        Ok(())
     }
 
     /// Constructs a borrowed version of this type for more efficient querying.

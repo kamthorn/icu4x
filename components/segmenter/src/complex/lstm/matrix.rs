@@ -40,7 +40,7 @@ impl<'a> From<&'a crate::provider::LstmMatrix3<'a>> for MatrixZero<'a, 3> {
 }
 
 impl<'a, const D: usize> MatrixZero<'a, D> {
-    pub(super) fn as_slice(&self) -> &ZeroSlice<f32> {
+    pub(super) fn as_slice(&self) -> &'a ZeroSlice<f32> {
         self.data
     }
 
@@ -67,9 +67,8 @@ impl<'a, const D: usize> MatrixZero<'a, D> {
     }
 }
 
-impl MatrixZero<'_, 3> {
-    pub(super) fn dim(&self) -> (usize, usize, usize) {
-        let [d0, d1, d2] = self.dims;
-        (d0, d1, d2)
+impl<const D: usize> MatrixZero<'_, D> {
+    pub(super) fn dims(&self) -> [usize; D] {
+        self.dims
     }
 }

@@ -43,12 +43,12 @@ impl<R: RuleBreakType> Iterator for LstmSegmenterIterator<'_, '_, R> {
 pub(super) struct LstmSegmenter<'data> {
     dic: ZeroMapBorrowed<'data, PotentialUtf8, u16>,
     embedding: MatrixZero<'data, 2>,
-    fw_w: MatrixZero<'data, 3>,
-    fw_u: MatrixZero<'data, 3>,
-    fw_b: MatrixZero<'data, 2>,
-    bw_w: MatrixZero<'data, 3>,
-    bw_u: MatrixZero<'data, 3>,
-    bw_b: MatrixZero<'data, 2>,
+    fw_w: MatrixZero<'data, 2>,
+    fw_u: MatrixZero<'data, 2>,
+    fw_b: MatrixZero<'data, 1>,
+    bw_w: MatrixZero<'data, 2>,
+    bw_u: MatrixZero<'data, 2>,
+    bw_b: MatrixZero<'data, 1>,
     timew_fw: MatrixZero<'data, 2>,
     timew_bw: MatrixZero<'data, 2>,
     time_b: MatrixZero<'data, 1>,
@@ -58,10 +58,10 @@ pub(super) struct LstmSegmenter<'data> {
 impl<'data> LstmSegmenter<'data> {
     /// Returns `Err` if grapheme data is required but not present
     pub(super) fn new(
-        lstm: &'data LstmData<'data>,
+        lstm: &'data LstmDataV2<'data>,
         grapheme: GraphemeClusterSegmenterBorrowed<'data>,
     ) -> Self {
-        let LstmData::Float32(lstm) = lstm;
+        let LstmDataV2::Float32(lstm) = lstm;
         let time_w = MatrixZero::from(&lstm.time_w);
         #[expect(clippy::unwrap_used)] // shape (2, 4, hunits)
         let timew_fw = time_w.submatrix(0).unwrap();
@@ -224,7 +224,7 @@ impl<'data> LstmSegmenter<'data> {
 
 #[derive(Debug)]
 struct BiesIterator<'data> {
-    fw: Direction,
+    fw: Direction<'data>,
     timew_fw: MatrixZero<'data, 2>,
     timew_bw: MatrixZero<'data, 2>,
     time_b: MatrixZero<'data, 1>,
@@ -256,7 +256,7 @@ impl<'data> BiesIterator<'data> {
         }: LstmSegmenter<'data>,
         input_seq: Vec<u16>,
     ) -> Self {
-        let hunits = fw_u.dim().1;
+        let [hunits, _] = fw_u.dims();
 
         let mut ids = input_seq.clone();
         ids.sort_unstable();
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn segment_file_by_lstm() {
-        let lstm: DataResponse<SegmenterLstmAutoV1> = Baked
+        let lstm: DataResponse<SegmenterLstmAutoV2> = Baked
             .load(DataRequest {
                 id: DataIdentifierBorrowed::for_marker_attributes(
                     DataMarkerAttributes::from_str_or_panic(

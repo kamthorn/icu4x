@@ -22,6 +22,15 @@ icu_provider::data_marker!(
 );
 
 icu_provider::data_marker!(
+    /// `SegmenterLstmWordLineAutoV2`
+    SegmenterLstmAutoV2,
+    "segmenter/lstm/auto/v2",
+    LstmDataV2<'static>,
+    #[cfg(feature = "datagen")]
+    attributes_domain = "segmenter"
+);
+
+icu_provider::data_marker!(
     /// `SegmenterDictionaryWordAutoV1`
     SegmenterDictionaryAutoV1,
     "segmenter/dictionary/auto/v1",

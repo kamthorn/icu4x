@@ -43,14 +43,14 @@ impl<R: RuleBreakType> Iterator for ComplexIterator<'_, '_, R> {
 enum ComplexPayload {
     Dict(DataPayload<ErasedMarker<DictionaryBreakData<'static>>>),
     #[cfg(feature = "lstm")]
-    Lstm(DataPayload<ErasedMarker<LstmData<'static>>>),
+    Lstm(DataPayload<ErasedMarker<LstmDataV2<'static>>>),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum ComplexPayloadBorrowed<'data> {
     Dict(&'data DictionaryBreakData<'data>),
     #[cfg(feature = "lstm")]
-    Lstm(&'data LstmData<'data>),
+    Lstm(&'data LstmDataV2<'data>),
 }
 
 impl<'data> ComplexPayloadBorrowed<'data> {
@@ -214,22 +214,22 @@ impl ComplexPayloadsBorrowed<'static> {
         #![expect(clippy::unwrap_used)]
         // try_load is infallible if the provider only returns `MissingLocale`.
         if self.my.is_none() {
-            self.my = try_load_static::<SegmenterLstmAutoV1, _>(&Baked, MY_LSTM)
+            self.my = try_load_static::<SegmenterLstmAutoV2, _>(&Baked, MY_LSTM)
                 .unwrap()
                 .map(ComplexPayloadBorrowed::Lstm);
         }
         if self.km.is_none() {
-            self.km = try_load_static::<SegmenterLstmAutoV1, _>(&Baked, KM_LSTM)
+            self.km = try_load_static::<SegmenterLstmAutoV2, _>(&Baked, KM_LSTM)
                 .unwrap()
                 .map(ComplexPayloadBorrowed::Lstm);
         }
         if self.lo.is_none() {
-            self.lo = try_load_static::<SegmenterLstmAutoV1, _>(&Baked, LO_LSTM)
+            self.lo = try_load_static::<SegmenterLstmAutoV2, _>(&Baked, LO_LSTM)
                 .unwrap()
                 .map(ComplexPayloadBorrowed::Lstm);
         }
         if self.th.is_none() {
-            self.th = try_load_static::<SegmenterLstmAutoV1, _>(&Baked, TH_LSTM)
+            self.th = try_load_static::<SegmenterLstmAutoV2, _>(&Baked, TH_LSTM)
                 .unwrap()
                 .map(ComplexPayloadBorrowed::Lstm);
         }
@@ -324,26 +324,61 @@ impl ComplexPayloads {
     #[cfg(feature = "lstm")]
     pub(crate) fn with_southeast_asian_lstms<D>(&mut self, provider: &D) -> Result<(), DataError>
     where
-        D: DataProvider<SegmenterLstmAutoV1> + ?Sized,
+        D: DataProvider<SegmenterLstmAutoV2> + ?Sized,
     {
         if self.my.is_none() {
-            self.my = try_load::<SegmenterLstmAutoV1, D>(provider, MY_LSTM)?
+            self.my = try_load::<SegmenterLstmAutoV2, D>(provider, MY_LSTM)?
                 .map(DataPayload::cast)
                 .map(ComplexPayload::Lstm);
         }
         if self.km.is_none() {
-            self.km = try_load::<SegmenterLstmAutoV1, D>(provider, KM_LSTM)?
+            self.km = try_load::<SegmenterLstmAutoV2, D>(provider, KM_LSTM)?
                 .map(DataPayload::cast)
                 .map(ComplexPayload::Lstm);
         }
         if self.lo.is_none() {
-            self.lo = try_load::<SegmenterLstmAutoV1, D>(provider, LO_LSTM)?
+            self.lo = try_load::<SegmenterLstmAutoV2, D>(provider, LO_LSTM)?
                 .map(DataPayload::cast)
                 .map(ComplexPayload::Lstm);
         }
         if self.th.is_none() {
-            self.th = try_load::<SegmenterLstmAutoV1, D>(provider, TH_LSTM)?
+            self.th = try_load::<SegmenterLstmAutoV2, D>(provider, TH_LSTM)?
                 .map(DataPayload::cast)
+                .map(ComplexPayload::Lstm);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "lstm")]
+    #[cfg(feature = "serde")]
+    pub(crate) fn with_southeast_asian_lstms_buffer<D>(
+        &mut self,
+        provider: &D,
+    ) -> Result<(), DataError>
+    where
+        D: DataProvider<SegmenterLstmAutoV1> + DataProvider<SegmenterLstmAutoV2> + ?Sized,
+    {
+        if let Ok(()) = self.with_southeast_asian_lstms(provider) {
+            return Ok(());
+        }
+        if self.my.is_none() {
+            self.my = try_load::<SegmenterLstmAutoV1, D>(provider, MY_LSTM)?
+                .map(|p| DataPayload::from_owned(LstmDataV2::from(p.get())))
+                .map(ComplexPayload::Lstm);
+        }
+        if self.km.is_none() {
+            self.km = try_load::<SegmenterLstmAutoV1, D>(provider, KM_LSTM)?
+                .map(|p| DataPayload::from_owned(LstmDataV2::from(p.get())))
+                .map(ComplexPayload::Lstm);
+        }
+        if self.lo.is_none() {
+            self.lo = try_load::<SegmenterLstmAutoV1, D>(provider, LO_LSTM)?
+                .map(|p| DataPayload::from_owned(LstmDataV2::from(p.get())))
+                .map(ComplexPayload::Lstm);
+        }
+        if self.th.is_none() {
+            self.th = try_load::<SegmenterLstmAutoV1, D>(provider, TH_LSTM)?
+                .map(|p| DataPayload::from_owned(LstmDataV2::from(p.get())))
                 .map(ComplexPayload::Lstm);
         }
         Ok(())

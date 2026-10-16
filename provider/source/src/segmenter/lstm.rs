@@ -6,8 +6,8 @@
 
 use crate::{IterableDataProviderCached, SourceDataProvider};
 use icu::segmenter::provider::{
-    LstmData, LstmDataFloat32, LstmMatrix1, LstmMatrix2, LstmMatrix3, ModelType,
-    SegmenterLstmAutoV1,
+    LstmData, LstmDataFloat32, LstmDataV2, LstmMatrix1, LstmMatrix2, LstmMatrix3, ModelType,
+    SegmenterLstmAutoV2,
 };
 use icu_provider::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayBase, Dim, Dimension, OwnedRepr};
@@ -184,9 +184,9 @@ convert!(ndarray_to_lstm_matrix1, LstmMatrix1, 1);
 convert!(ndarray_to_lstm_matrix2, LstmMatrix2, 2);
 convert!(ndarray_to_lstm_matrix3, LstmMatrix3, 3);
 
-impl DataProvider<SegmenterLstmAutoV1> for SourceDataProvider {
-    fn load(&self, req: DataRequest) -> Result<DataResponse<SegmenterLstmAutoV1>, DataError> {
-        self.check_req::<SegmenterLstmAutoV1>(req)?;
+impl DataProvider<SegmenterLstmAutoV2> for SourceDataProvider {
+    fn load(&self, req: DataRequest) -> Result<DataResponse<SegmenterLstmAutoV2>, DataError> {
+        self.check_req::<SegmenterLstmAutoV2>(req)?;
 
         let lstm_data = self
             .segmenter_lstm()?
@@ -196,7 +196,7 @@ impl DataProvider<SegmenterLstmAutoV1> for SourceDataProvider {
             ))
             .map_err(|_| DataErrorKind::IdentifierNotFound.into_error())?;
 
-        let data = lstm_data.try_convert()?;
+        let data = LstmDataV2::from(&lstm_data.try_convert()?);
 
         Ok(DataResponse {
             metadata: Default::default(),
@@ -205,7 +205,7 @@ impl DataProvider<SegmenterLstmAutoV1> for SourceDataProvider {
     }
 }
 
-impl IterableDataProviderCached<SegmenterLstmAutoV1> for SourceDataProvider {
+impl IterableDataProviderCached<SegmenterLstmAutoV2> for SourceDataProvider {
     fn iter_ids_cached(&self) -> Result<HashSet<DataIdentifierCow<'static>>, DataError> {
         Ok(self
             .segmenter_lstm()?
@@ -231,10 +231,11 @@ mod tests {
             SourceDataProvider: DataProvider<M>,
         {
             fn load(&self, req: DataRequest) -> Result<DataResponse<M>, DataError> {
-                if SegmenterLstmAutoV1::INFO == M::INFO {
+                if SegmenterLstmAutoV2::INFO == M::INFO {
                     return Ok(DataResponse {
-                        payload: DataPayload::<SegmenterLstmAutoV1>::from_owned(
-                            self.0
+                        payload: DataPayload::<SegmenterLstmAutoV2>::from_owned(
+                            (&self
+                                .0
                                 .segmenter_lstm()
                                 .unwrap()
                                 .read_and_parse_json::<RawLstmData>(
@@ -242,7 +243,8 @@ mod tests {
                                 )
                                 .unwrap()
                                 .try_convert()
-                                .unwrap(),
+                                .unwrap())
+                                .into(),
                         )
                         .dynamic_cast()?,
                         metadata: Default::default(),

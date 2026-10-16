@@ -2,133 +2,83 @@
 // called LICENSE at the top level of the ICU4X source tree
 // (online at: https://github.com/unicode-org/icu4x/blob/main/LICENSE ).
 
-//! The LSTM recurrence, with the weights rearranged so that every inner loop
-//! runs over contiguous `f32` slices of length `4 * hunits` and can be
-//! vectorized by the compiler.
-//!
-//! The data stores `W` as `(4, hunits, embedd_dim)` and `U` as `(4, hunits, hunits)`,
-//! so `W·x` and `U·h` are many short dot products. Here both are transposed once per
-//! segmentation call, which turns them into `axpy` operations over the `4 * hunits`
-//! gate values. `W·x` only depends on the input id, so it is computed once for every
-//! distinct id of the input instead of once per position.
+//! The LSTM recurrence. Every inner loop runs over the `4 * hunits` contiguous gate
+//! values of one row of `W` or `U`, so that it can be vectorized by the compiler.
+//! `W·x` only depends on the input id, so it is computed once for every distinct id
+//! of the input instead of once per position.
 
 use super::matrix::MatrixZero;
 use alloc::vec;
 use alloc::vec::Vec;
 #[allow(unused_imports)]
 use core_maths::*;
-use zerovec::ZeroSlice;
-use zerovec::ule::AsULE;
+use zerovec::ule::{AsULE, RawBytesULE};
 
 /// Gate values are processed in blocks of this many lanes, which stay in registers
 /// while the block accumulates `U·h`.
 const LANES: usize = 16;
 
 /// The weights of one direction of the LSTM, prepared for one input.
-///
-/// Rows of `xw` and `ut` hold the `4 * hunits` gate values padded with zeros to
-/// `stride`, a multiple of [`LANES`].
 #[derive(Debug)]
-pub(super) struct Direction {
+pub(super) struct Direction<'data> {
     hunits: usize,
-    stride: usize,
-    /// `b + W·x` for each distinct input id (in the order of `ids`).
+    /// `b + W·x` for each distinct input id (in the order of `ids`), `4 * hunits` values each.
     xw: Vec<f32>,
-    /// `U` transposed: row `k` holds the gate weights that multiply `h[k]`.
-    ut: Vec<f32>,
+    /// `U` as `hunits` rows of `4 * hunits` values: row `k` multiplies `h[k]`.
+    u: &'data [RawBytesULE<4>],
 }
 
-/// Transposes a row-major `rows × cols` matrix into `cols` rows of `stride >= rows` values.
-fn transpose(m: &ZeroSlice<f32>, rows: usize, cols: usize, stride: usize) -> Vec<f32> {
-    let mut out = vec![0.0; stride * cols];
-    if cols == 0 {
-        return out;
-    }
-    for (r, row) in m.as_ule_slice().chunks_exact(cols).take(rows).enumerate() {
-        for (c, v) in row.iter().enumerate() {
-            if let Some(dest) = out.get_mut(c * stride + r) {
-                *dest = f32::from_unaligned(*v);
-            }
-        }
-    }
-    out
-}
-
-impl Direction {
-    /// `ids` are the sorted, distinct embedding ids of the input.
+impl<'data> Direction<'data> {
+    /// `w` has shape `(embedd_dim, 4 * hunits)`, `u` `(hunits, 4 * hunits)` and `b`
+    /// `(4 * hunits)`. `ids` are the sorted, distinct embedding ids of the input.
     pub(super) fn new(
         embedding: MatrixZero<'_, 2>,
-        w: MatrixZero<'_, 3>,
-        u: MatrixZero<'_, 3>,
-        b: MatrixZero<'_, 2>,
+        w: MatrixZero<'_, 2>,
+        u: MatrixZero<'data, 2>,
+        b: MatrixZero<'_, 1>,
         ids: &[u16],
     ) -> Self {
-        let (_, hunits, embedd_dim) = w.dim();
-        let gates = 4 * hunits;
-        let stride = gates.div_ceil(LANES) * LANES;
-        let ut = transpose(u.as_slice(), gates, hunits, stride);
-        let mut bias: Vec<f32> = b.as_slice().iter().collect();
-        bias.resize(stride, 0.0);
-
-        // W is transposed one block of LANES rows at a time instead of as a whole,
-        // which keeps the scratch space small.
-        let mut xw = vec![0.0; ids.len() * stride];
-        let mut tile = vec![0.0; embedd_dim * LANES];
-        let w_rows = w.as_slice().as_ule_slice().chunks_exact(embedd_dim.max(1));
-        for (bi, bias_block) in bias.as_chunks::<LANES>().0.iter().enumerate() {
-            tile.fill(0.0);
-            for (l, row) in w_rows.clone().skip(bi * LANES).take(LANES).enumerate() {
-                for (k, v) in row.iter().enumerate() {
-                    if let Some(dest) = tile.get_mut(k * LANES + l) {
-                        *dest = f32::from_unaligned(*v);
-                    }
-                }
-            }
-            for (&id, out) in ids.iter().zip(xw.chunks_exact_mut(stride)) {
-                let Some(e) = embedding.submatrix::<1>(id as usize) else {
-                    debug_assert!(false, "id is at most dict.len()");
-                    continue;
-                };
-                let mut acc = *bias_block;
-                for (xk, t) in e.as_slice().iter().zip(tile.as_chunks::<LANES>().0) {
-                    for (a, t) in acc.iter_mut().zip(t) {
-                        *a += xk * t;
-                    }
-                }
-                if let Some(out) = out.as_chunks_mut::<LANES>().0.get_mut(bi) {
-                    *out = acc;
-                }
-            }
+        let [hunits, gates] = u.dims();
+        let bias: Vec<f32> = b.as_slice().iter().collect();
+        let mut x = Vec::new();
+        let mut xw = vec![0.0; ids.len() * gates];
+        for (&id, out) in ids.iter().zip(xw.chunks_exact_mut(gates.max(1))) {
+            let Some(e) = embedding.submatrix::<1>(id as usize) else {
+                debug_assert!(false, "id is at most dict.len()");
+                continue;
+            };
+            x.clear();
+            x.extend(e.as_slice().iter());
+            add_mul_rows(&bias, &x, w.as_slice().as_ule_slice(), out);
         }
 
         Self {
             hunits,
-            stride,
             xw,
-            ut,
+            u: u.as_slice().as_ule_slice(),
         }
     }
 
     /// The length of the scratch space that [`Self::step`] needs.
     pub(super) fn scratch_len(&self) -> usize {
-        self.stride
+        4 * self.hunits
     }
 
     /// One LSTM step for the input id at index `slot` of `ids`. Updates `h` and `c`;
     /// `s` is scratch space of length [`Self::scratch_len`].
     pub(super) fn step(&self, slot: usize, h: &mut [f32], c: &mut [f32], s: &mut [f32]) {
         let hunits = self.hunits;
-        let stride = self.stride;
-        let Some(xw) = self.xw.get(slot * stride..(slot + 1) * stride) else {
+        let gates = 4 * hunits;
+        let Some(xw) = self.xw.get(slot * gates..(slot + 1) * gates) else {
             debug_assert!(false, "slot is an index of ids");
             return;
         };
         // s = xw + U·h
-        add_mul_transposed(xw, h, &self.ut, s);
+        add_mul_rows(xw, h, self.u, s);
 
         // Gates in the order input, forget, cell, output. Each activation runs over a
         // contiguous slice so that the loop can be vectorized.
-        let Some((ifg, o)) = s.get_mut(..4 * hunits).map(|s| s.split_at_mut(3 * hunits)) else {
+        let Some((ifg, o)) = s.get_mut(..gates).map(|s| s.split_at_mut(3 * hunits)) else {
             debug_assert!(false, "s has 4 * hunits values");
             return;
         };
@@ -145,30 +95,45 @@ impl Direction {
     }
 }
 
-/// `out = init + Mᵀ·x`, where `mt` holds `x.len()` rows of `out.len()` values.
+/// `out = init + Σ x[k] · m[k]`, where `m` holds `x.len()` rows of `out.len()` values.
 ///
 /// `out` is computed one block of [`LANES`] values at a time, so the block stays in
-/// registers while the rows of `mt` are accumulated into it. All lengths are multiples
-/// of [`LANES`] except `x.len()`.
+/// registers while the rows of `m` are accumulated into it. If `out.len()` is not a
+/// multiple of [`LANES`], the last block overlaps the one before it; the overlapping
+/// values are computed the same way, so they are just written twice. The values of
+/// each row are added in the order of `k`.
 #[inline]
-fn add_mul_transposed(init: &[f32], x: &[f32], mt: &[f32], out: &mut [f32]) {
-    let stride = out.len();
-    for (bi, (out_block, init_block)) in out
-        .as_chunks_mut::<LANES>()
-        .0
-        .iter_mut()
-        .zip(init.as_chunks::<LANES>().0)
-        .enumerate()
-    {
-        let mut acc = *init_block;
-        for (xk, row) in x.iter().zip(mt.chunks_exact(stride)) {
-            if let Some(m) = row.as_chunks::<LANES>().0.get(bi) {
+fn add_mul_rows(init: &[f32], x: &[f32], m: &[RawBytesULE<4>], out: &mut [f32]) {
+    let n = out.len();
+    let rows = m.chunks_exact(n.max(1));
+    if n < LANES {
+        for (a, i) in out.iter_mut().zip(init) {
+            *a = *i;
+        }
+        for (xk, row) in x.iter().zip(rows) {
+            for (a, m) in out.iter_mut().zip(row) {
+                *a += xk * f32::from_unaligned(*m);
+            }
+        }
+        return;
+    }
+    for start in (0..n - LANES).step_by(LANES).chain([n - LANES]) {
+        let Some(init) = init.get(start..start + LANES) else {
+            debug_assert!(false, "init has n values");
+            return;
+        };
+        let mut acc = [0.0; LANES];
+        acc.copy_from_slice(init);
+        for (xk, row) in x.iter().zip(rows.clone()) {
+            if let Some(m) = row.get(start..start + LANES) {
                 for (a, m) in acc.iter_mut().zip(m) {
-                    *a += xk * m;
+                    *a += xk * f32::from_unaligned(*m);
                 }
             }
         }
-        *out_block = acc;
+        if let Some(out) = out.get_mut(start..start + LANES) {
+            out.copy_from_slice(&acc);
+        }
     }
 }
 
@@ -262,18 +227,18 @@ mod tests {
         x: &[f64],
         h: &mut [f64],
         c: &mut [f64],
-        w: MatrixZero<'_, 3>,
-        u: MatrixZero<'_, 3>,
-        b: MatrixZero<'_, 2>,
+        w: MatrixZero<'_, 2>,
+        u: MatrixZero<'_, 2>,
+        b: MatrixZero<'_, 1>,
     ) {
-        let (_, hunits, embedd_dim) = w.dim();
+        let [hunits, gates] = u.dims();
         let w: Vec<f64> = w.as_slice().iter().map(f64::from).collect();
         let u: Vec<f64> = u.as_slice().iter().map(f64::from).collect();
         let b: Vec<f64> = b.as_slice().iter().map(f64::from).collect();
-        let s: Vec<f64> = (0..4 * hunits)
+        let s: Vec<f64> = (0..gates)
             .map(|r| {
-                let wx: f64 = (0..embedd_dim).map(|k| w[r * embedd_dim + k] * x[k]).sum();
-                let uh: f64 = (0..hunits).map(|k| u[r * hunits + k] * h[k]).sum();
+                let wx: f64 = (0..x.len()).map(|k| w[k * gates + r] * x[k]).sum();
+                let uh: f64 = (0..hunits).map(|k| u[k * gates + r] * h[k]).sum();
                 b[r] + wx + uh
             })
             .collect();
@@ -292,7 +257,7 @@ mod tests {
 
     #[test]
     fn step_matches_reference() {
-        let lstm: DataResponse<SegmenterLstmAutoV1> = Baked
+        let lstm: DataResponse<SegmenterLstmAutoV2> = Baked
             .load(DataRequest {
                 id: DataIdentifierBorrowed::for_marker_attributes(
                     DataMarkerAttributes::from_str_or_panic(
@@ -302,7 +267,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let LstmData::Float32(lstm) = lstm.payload.get();
+        let LstmDataV2::Float32(lstm) = lstm.payload.get();
         let embedding = MatrixZero::from(&lstm.embedding);
         let num_ids = lstm.dic.len() + 1;
 
@@ -324,7 +289,7 @@ mod tests {
                 MatrixZero::from(u),
                 MatrixZero::from(b),
             );
-            let hunits = u.dim().1;
+            let [hunits, _] = u.dims();
             let direction = Direction::new(embedding, w, u, b, &ids);
 
             let mut h = vec![0.0; hunits];
