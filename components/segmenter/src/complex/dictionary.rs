@@ -6,6 +6,10 @@ use crate::grapheme::*;
 use crate::indices::*;
 use crate::provider::*;
 use crate::scaffold::{PotentiallyIllFormedUtf8, RuleBreakType, Utf8, Utf16};
+use alloc::vec::Vec;
+use icu_collections::char16trie::Char16TrieCursor;
+use icu_collections::codepointinvlist::CodePointInversionList;
+use zerotrie::cursor::ZeroTrieSimpleAsciiCursor;
 
 /// Thai and Lao vowel signs and marks that cannot start a word.
 fn is_dependent(c: u32) -> bool {
@@ -15,9 +19,68 @@ fn is_dependent(c: u32) -> bool {
     )
 }
 
+/// Whether a Thai or Lao word can start with `c` (a consonant or a leading vowel). Other
+/// characters are not restricted.
+fn can_begin_word(c: u32) -> bool {
+    match c {
+        0x0E00..=0x0E7F => matches!(c, 0x0E01..=0x0E2E | 0x0E40..=0x0E44),
+        0x0E80..=0x0EFF => matches!(c, 0x0E81..=0x0EAE | 0x0EC0..=0x0EC4 | 0x0EDC..=0x0EDF),
+        _ => true,
+    }
+}
+
 /// Thai and Lao vowels written before their consonant, which cannot end a word.
 fn is_leading_vowel(c: u32) -> bool {
     matches!(c, 0x0E40..=0x0E44 | 0x0EC0..=0x0EC4)
+}
+
+enum Cursor<'a> {
+    Char16(Char16TrieCursor<'a>),
+    Zero {
+        alphabet: &'a CodePointInversionList<'a>,
+        cursor: ZeroTrieSimpleAsciiCursor<'a>,
+    },
+}
+
+impl<'a> Cursor<'a> {
+    fn new(trie: &'a DictionaryBreakData<'a>) -> Self {
+        match trie {
+            DictionaryBreakData::Char16Trie(trie) => Cursor::Char16(trie.cursor()),
+            DictionaryBreakData::ZeroTrie { alphabet, trie } => Cursor::Zero {
+                alphabet,
+                cursor: trie.cursor(),
+            },
+        }
+    }
+
+    /// Steps the walk by `c`. Returns whether a word ends here, and whether no longer word can.
+    fn step(&mut self, c: u32) -> (bool, bool) {
+        match self {
+            Cursor::Char16(cursor) => {
+                cursor.step32(c);
+                (cursor.value().is_some(), cursor.is_empty())
+            }
+            Cursor::Zero { alphabet, cursor } => {
+                cursor.step(alphabet.position32(c).map(|i| i as u8).unwrap_or(0xFF));
+                (cursor.take_value().is_some(), cursor.is_empty())
+            }
+        }
+    }
+}
+
+/// A token found by [`DictionaryBreakIterator::scan`].
+#[derive(Debug)]
+struct Token<'data, 's, R: RuleBreakType> {
+    /// The end of the token. After the scan, the iterator is at this position.
+    end: usize,
+    /// Whether the token is a dictionary word.
+    word: bool,
+    /// Shorter dictionary words at the same position, with the iterator states after them. Only
+    /// collected for the Southeast Asian dictionaries.
+    shorter: Vec<(usize, R::IterAttr<'s>)>,
+    /// A grapheme iterator state at or before the end of the shortest word, if there are shorter
+    /// words.
+    grapheme_iter: Option<GraphemeClusterBreakIterator<'data, 's, R>>,
 }
 
 /// Lifetimes:
@@ -29,10 +92,135 @@ pub(super) struct DictionaryBreakIterator<'data, 's, R: RuleBreakType> {
     iter: R::IterAttr<'s>,
     len: usize,
     grapheme_iter: GraphemeClusterBreakIterator<'data, 's, R>,
-    // TODO transform value for byte trie
+    /// A token that was scanned to decide the previous one, and is returned next.
+    pending: Option<Token<'data, 's, R>>,
+    /// Allocations for [`Token::shorter`] to reuse.
+    spare: Vec<Vec<(usize, R::IterAttr<'s>)>>,
 }
 
-impl<'s, R: RuleBreakType> DictionaryBreakIterator<'_, 's, R> {
+impl<'data, 's, R: RuleBreakType> DictionaryBreakIterator<'data, 's, R> {
+    /// How far into the text a chain of up to `words` dictionary words starting at `iter` reaches.
+    /// The end of the text, or a character that no word starts with, counts as reaching the end.
+    fn reach(&self, iter: &R::IterAttr<'s>, words: u8) -> usize {
+        let here = match iter.clone().next() {
+            None => return usize::MAX,
+            Some((_, c)) if !can_begin_word(c.into()) => return usize::MAX,
+            Some((pos, _)) => pos,
+        };
+        if words == 0 {
+            return here;
+        }
+        let mut iter = iter.clone();
+        let mut cursor = Cursor::new(self.trie);
+        let mut best = here;
+        while let Some((_, c)) = iter.next() {
+            let (has_value, is_empty) = cursor.step(c.into());
+            if has_value && !matches!(iter.clone().next(), Some((_, c)) if is_dependent(c.into())) {
+                best = best.max(self.reach(&iter, words - 1));
+                if best == usize::MAX {
+                    break;
+                }
+            }
+            if is_empty {
+                break;
+            }
+        }
+        best
+    }
+
+    fn recycle(&mut self, mut shorter: Vec<(usize, R::IterAttr<'s>)>) {
+        if shorter.capacity() > 0 && self.spare.len() < 2 {
+            shorter.clear();
+            self.spare.push(shorter);
+        }
+    }
+
+    /// Finds the next token: the longest dictionary word at the current position (also returning
+    /// the shorter ones), or the extent of text that no dictionary word matches.
+    fn scan(&mut self) -> Option<Token<'data, 's, R>> {
+        let mut cursor = Cursor::new(self.trie);
+        let keep_shorter = matches!(self.trie, DictionaryBreakData::ZeroTrie { .. });
+        let mut not_match = false;
+        let mut last_grapheme_offset = 0;
+        let mut token_start = None;
+        let mut grapheme_iter = None;
+        let mut longest_grapheme_iter = None;
+        let mut words = self.spare.pop().unwrap_or_default();
+
+        loop {
+            let before = self.iter.clone();
+            let Some(next) = self.iter.next() else {
+                break;
+            };
+            let start = *token_start.get_or_insert(next.0);
+            let (has_value, is_empty) = cursor.step(next.1.into());
+            let end = next.0 + R::char_len(next.1);
+
+            if has_value && self.is_word_end(end, &mut last_grapheme_offset) {
+                if words.is_empty() {
+                    // Grapheme boundaries are only searched forward, so the state after the
+                    // shortest word is good for rewinding to any of the words.
+                    grapheme_iter = Some(self.grapheme_iter.clone_internal());
+                } else {
+                    if !keep_shorter {
+                        words.clear();
+                    }
+                    longest_grapheme_iter = Some(self.grapheme_iter.clone_internal());
+                }
+                words.push((end, self.iter.clone()));
+                if is_empty {
+                    break;
+                }
+            } else if is_empty {
+                if words.is_empty() {
+                    self.recycle(words);
+                    // Not found
+                    let end = self.end_of_unknown(next, before, start, &mut last_grapheme_offset);
+                    return Some(Token {
+                        end,
+                        word: false,
+                        shorter: Vec::new(),
+                        grapheme_iter: None,
+                    });
+                }
+                break;
+            } else if !has_value {
+                // Prefix string is matched
+                not_match = true;
+            }
+        }
+
+        let Some((end, iter)) = words.pop() else {
+            self.recycle(words);
+            // no match by scanning text
+            return not_match.then_some(Token {
+                end: self.len,
+                word: false,
+                shorter: Vec::new(),
+                grapheme_iter: None,
+            });
+        };
+        // Rewind to the end of the longest word.
+        self.iter = iter;
+        let mut kept = None;
+        match (grapheme_iter, longest_grapheme_iter) {
+            (Some(shortest), Some(longest)) => {
+                self.grapheme_iter = longest;
+                if !words.is_empty() {
+                    kept = Some(shortest);
+                }
+            }
+            (Some(only), None) => self.grapheme_iter = only,
+            _ => (),
+        }
+        Some(Token {
+            end,
+            word: true,
+            shorter: words,
+            grapheme_iter: kept,
+        })
+    }
+
     /// Moves `last_grapheme_offset` to the first grapheme cluster boundary at or after `end`.
     fn advance_graphemes(&mut self, end: usize, last_grapheme_offset: &mut usize) {
         while *last_grapheme_offset < end {
@@ -106,88 +294,57 @@ impl<Y: RuleBreakType> Iterator for DictionaryBreakIterator<'_, '_, Y> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        enum Cursor<'a> {
-            Char16(icu_collections::char16trie::Char16TrieCursor<'a>),
-            Zero {
-                alphabet: &'a icu_collections::codepointinvlist::CodePointInversionList<'a>,
-                cursor: zerotrie::cursor::ZeroTrieSimpleAsciiCursor<'a>,
-            },
-        }
-
-        let mut trie_iter = match self.trie {
-            DictionaryBreakData::Char16Trie(trie) => Cursor::Char16(trie.cursor()),
-            DictionaryBreakData::ZeroTrie { alphabet, trie } => Cursor::Zero {
-                alphabet,
-                cursor: trie.cursor(),
-            },
+        let mut token = match self.pending.take() {
+            Some(token) => token,
+            None => self.scan()?,
         };
-        let mut intermediate_length = 0;
-        let mut not_match = false;
-        let mut previous_match = None;
-        let mut last_grapheme_offset = 0;
-        let mut token_start = None;
-
-        loop {
-            let before = self.iter.clone();
-            let Some(next) = self.iter.next() else {
-                break;
-            };
-            let start = *token_start.get_or_insert(next.0);
-            let step_result = match &mut trie_iter {
-                Cursor::Char16(cursor) => {
-                    cursor.step32(next.1.into());
-                    (cursor.value().is_some(), cursor.is_empty())
-                }
-                Cursor::Zero { alphabet, cursor } => {
-                    cursor.step(
-                        alphabet
-                            .position32(next.1.into())
-                            .map(|i| i as u8)
-                            .unwrap_or(0xFF),
-                    );
-                    (cursor.take_value().is_some(), cursor.is_empty())
-                }
-            };
-            let (has_value, is_empty) = step_result;
-            let end = next.0 + Y::char_len(next.1);
-
-            if has_value && self.is_word_end(end, &mut last_grapheme_offset) {
-                if is_empty {
-                    return Some(end);
-                }
-                intermediate_length = end;
-                previous_match = Some((self.iter.clone(), self.grapheme_iter.clone_internal()));
-            } else if is_empty {
-                if intermediate_length > 0 {
-                    if let Some((prev_iter, prev_grapheme_iter)) = previous_match {
-                        // Rewind previous match point
-                        self.iter = prev_iter;
-                        self.grapheme_iter = prev_grapheme_iter;
-                    }
-                    return Some(intermediate_length);
-                }
-                // Not found
-                return Some(self.end_of_unknown(next, before, start, &mut last_grapheme_offset));
-            } else if !has_value {
-                // Prefix string is matched
-                not_match = true;
-            }
+        if token.shorter.is_empty() {
+            self.recycle(token.shorter);
+            return Some(token.end);
+        }
+        // The longest word is kept if the text after it is a dictionary word, which is then
+        // returned by the next call. This is like ICU4C's `ThaiBreakEngine`, which also looks
+        // ahead, but it only costs extra work when no word follows.
+        let at_boundary = match self.iter.clone().next() {
+            None => true,
+            Some((_, c)) => !can_begin_word(c.into()),
+        };
+        let following = if at_boundary { None } else { self.scan() };
+        if at_boundary || following.as_ref().is_some_and(|t| t.word) {
+            self.pending = following;
+            self.recycle(token.shorter);
+            return Some(token.end);
         }
 
-        if intermediate_length > 0 {
-            if let Some((prev_iter, prev_grapheme_iter)) = previous_match {
-                // Rewind the previous match point so that the trailing text is
-                // processed by the next call to `next`.
-                self.iter = prev_iter;
-                self.grapheme_iter = prev_grapheme_iter;
+        // No dictionary word follows the longest word. Take the shorter word after which the next
+        // dictionary word reaches furthest, if any word follows it.
+        let mut best = token.end;
+        let mut chosen = None;
+        for (i, (_, iter)) in token.shorter.iter().enumerate().rev() {
+            let reach = self.reach(iter, 1);
+            if reach > best {
+                best = reach;
+                chosen = Some(i);
+                if reach == usize::MAX {
+                    break;
+                }
             }
-            Some(intermediate_length)
-        } else if not_match {
-            // no match by scanning text
-            Some(self.len)
-        } else {
-            None
         }
+        let Some(i) = chosen else {
+            self.pending = following;
+            self.recycle(token.shorter);
+            return Some(token.end);
+        };
+        let (end, iter) = token.shorter.swap_remove(i);
+        self.iter = iter;
+        if let Some(grapheme_iter) = token.grapheme_iter {
+            self.grapheme_iter = grapheme_iter;
+        }
+        if let Some(following) = following {
+            self.recycle(following.shorter);
+        }
+        self.recycle(token.shorter);
+        Some(end)
     }
 }
 
@@ -217,6 +374,8 @@ impl<'data> DictionarySegmenter<'data> {
             iter: input.char_indices(),
             len: input.len(),
             grapheme_iter,
+            pending: None,
+            spare: Vec::new(),
         }
     }
 
@@ -231,6 +390,8 @@ impl<'data> DictionarySegmenter<'data> {
             iter: Utf8CharIndices::new(input),
             len: input.len(),
             grapheme_iter,
+            pending: None,
+            spare: Vec::new(),
         }
     }
 
@@ -245,6 +406,8 @@ impl<'data> DictionarySegmenter<'data> {
             iter: Utf16Indices::new(input),
             len: input.len(),
             grapheme_iter,
+            pending: None,
+            spare: Vec::new(),
         }
     }
 }
@@ -360,6 +523,15 @@ mod tests {
             &["ตาม", "ที่", "กล่าว", "มา", "แล้ว"],
             segmenter,
         );
+
+        // When no dictionary word follows the longest match, a shorter match that is followed by
+        // one wins (`ดีม` is in the dictionary).
+        check_complex(
+            "อาหารร้านนี้อร่อยดีมาก",
+            &["อาหาร", "ร้าน", "นี้", "อร่อย", "ดี", "มาก"],
+            segmenter,
+        );
+        check_complex("วันนี้อากาศดีมาก", &["วัน", "นี้", "อากาศ", "ดี", "มาก"], segmenter);
 
         for text in [
             "ลุงไมเคิลเดินไปตลาด",
